@@ -1,9 +1,14 @@
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
 
-/** Deja solo dígitos para el protocolo tel: (MicroSIP u otro handler del SO). */
+/** Deja solo dígitos para comparar números y armar el destino de `tel:`. */
 export function sanitizePhoneForCall(phone: string): string {
   return phone.replace(/\D/g, "");
+}
+
+/** Formato E.164 para MicroSIP u otro handler del SO (`tel:+57300...`). */
+function toE164TelHref(digits: string): string {
+  return `tel:+${digits}`;
 }
 
 export type RegisterCrmCallResult =
@@ -73,6 +78,6 @@ export async function initiateLocalPhoneCall(
     return false;
   }
 
-  window.location.href = `tel:${clean}`;
+  window.location.href = toE164TelHref(clean);
   return true;
 }

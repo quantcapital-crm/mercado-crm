@@ -20,11 +20,33 @@ const DATE_ONLY_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 const TP_ACCOUNT_MIN = 10_000_000;
 const TP_ACCOUNT_MAX = 99_999_999;
 
-/** Nombre del afiliado en `clients.affiliate` (columna texto, no UUID). */
-const DIAMOND_AFFILIATE_NAME = "Diamond";
+/** UUID de Supabase — afiliadora Diamond (flujo por defecto). */
+const DEFAULT_AFFILIATE_UUID = "061d974b-b5ac-466d-abbd-36087e3c3d00";
 
-/** UUID del asesor Diamond en `clients.owner_id` → `profiles.id`. */
-const DIAMOND_OWNER_ID = "061d974b-b5ac-466d-abbd-36087e3c3d00";
+/** UUID de Supabase — afiliadora Diamond Potential. */
+const DIAMOND_POTENTIAL_AFFILIATE_UUID = "d2b0d2cf-e016-4abc-8869-2edc88f99a8d";
+
+/** Mapeo de identificadores entrantes (`affiliate_id`) → UUID de afiliadora en Supabase. */
+const MAPEO_AFILIADORAS: Record<string, string> = {
+  diamond_potential: DIAMOND_POTENTIAL_AFFILIATE_UUID,
+};
+
+interface AffiliateAssignment {
+  affiliateName: string;
+  ownerId: string;
+}
+
+/** Configuración de inserción por UUID de afiliadora resuelto. */
+const AFFILIATE_ASSIGNMENT_BY_UUID: Record<string, AffiliateAssignment> = {
+  [DEFAULT_AFFILIATE_UUID]: {
+    affiliateName: "Diamond",
+    ownerId: DEFAULT_AFFILIATE_UUID,
+  },
+  [DIAMOND_POTENTIAL_AFFILIATE_UUID]: {
+    affiliateName: "Diamond Potential",
+    ownerId: DIAMOND_POTENTIAL_AFFILIATE_UUID,
+  },
+};
 
 const CLIENT_SELECT =
   "phone, first_name, last_name, email, country, affiliate, lead_status, tp_account, owner_id, total_calls, created_on, last_contacted, updated_at";
@@ -50,6 +72,25 @@ interface TrackboxLeadBody {
   email: string;
   country: string;
   tp_account?: string | null;
+  affiliate_id?: string | null;
+}
+
+interface ParsedTrackboxLead {
+  lead: TrackboxLeadBody;
+  affiliateUuid: string;
+}
+
+type ResolveAffiliateError = { ok: false; error: string };
+
+function isResolveAffiliateError(
+  value: unknown,
+): value is ResolveAffiliateError {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "ok" in value &&
+    (value as ResolveAffiliateError).ok === false
+  );
 }
 
 interface ActivityLogProfile {
@@ -225,11 +266,46 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim() !== "";
 }
 
+function resolveAffiliateUuid(
+  affiliateId: unknown,
+): string | ResolveAffiliateError {
+  if (
+    affiliateId === undefined ||
+    affiliateId === null ||
+    (typeof affiliateId === "string" && affiliateId.trim() === "")
+  ) {
+    return DEFAULT_AFFILIATE_UUID;
+  }
+
+  if (typeof affiliateId !== "string") {
+    return {
+      ok: false,
+      error: "El identificador de la afiliadora no es válido.",
+    };
+  }
+
+  const mappedUuid = MAPEO_AFILIADORAS[affiliateId.trim()];
+  if (!mappedUuid) {
+    return {
+      ok: false,
+      error: "El identificador de la afiliadora no es válido.",
+    };
+  }
+
+  return mappedUuid;
+}
+
+function extractAffiliateId(body: unknown): unknown {
+  if (!body || typeof body !== "object") return undefined;
+  return (body as Record<string, unknown>).affiliate_id;
+}
+
 function parseTrackboxLeadBody(body: unknown): TrackboxLeadBody | null {
   if (!body || typeof body !== "object") return null;
 
   const record = body as Record<string, unknown>;
   const tpAccount = record.tp_account;
+  const affiliateId = record.affiliate_id;
 
   if (
     !isNonEmptyString(record.first_name) ||
@@ -253,6 +329,27 @@ function parseTrackboxLeadBody(body: unknown): TrackboxLeadBody | null {
         : tpAccount == null
           ? null
           : null,
+    affiliate_id:
+      typeof affiliateId === "string"
+        ? affiliateId.trim() || null
+        : affiliateId == null
+          ? null
+          : null,
+  };
+}
+
+function parseTrackboxLead(
+  body: unknown,
+): ParsedTrackboxLead | ResolveAffiliateError | null {
+  const affiliateUuid = resolveAffiliateUuid(extractAffiliateId(body));
+  if (isResolveAffiliateError(affiliateUuid)) return affiliateUuid;
+
+  const lead = parseTrackboxLeadBody(body);
+  if (!lead) return null;
+
+  return {
+    lead,
+    affiliateUuid,
   };
 }
 
@@ -276,26 +373,41 @@ function toClientPayload(lead: TrackboxLeadBody): DbClientRow {
   });
 }
 
-/** Inyecta afiliado y asesor Diamond justo antes del insert en Supabase. */
-function withDiamondAssignment(
+function getAffiliateAssignment(affiliateUuid: string): AffiliateAssignment {
+  const assignment = AFFILIATE_ASSIGNMENT_BY_UUID[affiliateUuid];
+  if (!assignment) {
+    throw new Error(
+      `Configuración de afiliadora no encontrada para UUID: ${affiliateUuid}`,
+    );
+  }
+  return assignment;
+}
+
+/** Inyecta afiliadora y asesor justo antes del insert en Supabase. */
+function withAffiliateAssignment(
   row: Omit<DbClientRow, "affiliate" | "owner_id"> &
     Partial<Pick<DbClientRow, "affiliate" | "owner_id">>,
+  affiliateUuid: string,
 ): Record<string, unknown> {
+  const assignment = getAffiliateAssignment(affiliateUuid);
   return {
     ...row,
-    affiliate: DIAMOND_AFFILIATE_NAME,
-    owner_id: DIAMOND_OWNER_ID,
+    affiliate: assignment.affiliateName,
+    owner_id: assignment.ownerId,
   };
 }
 
-function parseTrackboxLeadArray(body: unknown): TrackboxLeadBody[] | null {
+function parseTrackboxLeadArray(
+  body: unknown,
+): ParsedTrackboxLead[] | ResolveAffiliateError | null {
   if (!Array.isArray(body) || body.length === 0) return null;
 
-  const parsed: TrackboxLeadBody[] = [];
+  const parsed: ParsedTrackboxLead[] = [];
   for (const item of body) {
-    const lead = parseTrackboxLeadBody(item);
-    if (!lead) return null;
-    parsed.push(lead);
+    const result = parseTrackboxLead(item);
+    if (isResolveAffiliateError(result)) return result;
+    if (!result) return null;
+    parsed.push(result);
   }
   return parsed;
 }
@@ -413,19 +525,27 @@ async function insertActivityLogsForClients(
   }
 }
 
-async function insertClientsBulk(payloads: DbClientRow[]): Promise<void> {
-  for (let i = 0; i < payloads.length; i += BULK_CHUNK_SIZE) {
-    const chunk = payloads.slice(i, i + BULK_CHUNK_SIZE);
-    const dbPayloads = chunk.map((row) =>
-      withDiamondAssignment({
-        first_name: row.first_name,
-        last_name: row.last_name,
-        phone: row.phone,
-        email: row.email,
-        country: row.country,
-        tp_account: row.tp_account,
-        lead_status: row.lead_status || "New",
-      }),
+interface BulkLeadInsertItem {
+  payload: DbClientRow;
+  affiliateUuid: string;
+}
+
+async function insertClientsBulk(items: BulkLeadInsertItem[]): Promise<void> {
+  for (let i = 0; i < items.length; i += BULK_CHUNK_SIZE) {
+    const chunk = items.slice(i, i + BULK_CHUNK_SIZE);
+    const dbPayloads = chunk.map(({ payload, affiliateUuid }) =>
+      withAffiliateAssignment(
+        {
+          first_name: payload.first_name,
+          last_name: payload.last_name,
+          phone: payload.phone,
+          email: payload.email,
+          country: payload.country,
+          tp_account: payload.tp_account,
+          lead_status: payload.lead_status || "New",
+        },
+        affiliateUuid,
+      ),
     );
     const { error } = await supabaseAdmin.from("clients").insert(dbPayloads);
     if (error) throw error;
@@ -433,17 +553,20 @@ async function insertClientsBulk(payloads: DbClientRow[]): Promise<void> {
 }
 
 async function processBulkLeads(
-  leads: TrackboxLeadBody[],
+  leads: ParsedTrackboxLead[],
 ): Promise<BulkUploadSummary> {
-  const sanitized = leads.map((lead) =>
-    sanitizeDbClientRow({
+  const sanitized = leads.map(({ lead, affiliateUuid }) => ({
+    payload: sanitizeDbClientRow({
       ...toClientPayload(lead),
     }),
-  );
+    affiliateUuid,
+  }));
 
-  const phones = sanitized.map((row) => row.phone);
+  const phones = sanitized.map((row) => row.payload.phone);
   const emails = sanitized
-    .map((row) => (row.email ? normalizeEmail(row.email) : ""))
+    .map((row) =>
+      row.payload.email ? normalizeEmail(row.payload.email) : "",
+    )
     .filter(Boolean);
 
   const [existingPhoneKeys, existingEmailKeys] = await Promise.all([
@@ -453,13 +576,13 @@ async function processBulkLeads(
 
   const seenPhoneKeys = new Set<string>();
   const seenEmails = new Set<string>();
-  const toInsert: DbClientRow[] = [];
+  const toInsert: BulkLeadInsertItem[] = [];
   let skippedDuplicates = 0;
 
-  for (const payload of sanitized) {
+  for (const item of sanitized) {
     if (
       isLeadDuplicate(
-        payload,
+        item.payload,
         existingPhoneKeys,
         existingEmailKeys,
         seenPhoneKeys,
@@ -470,16 +593,17 @@ async function processBulkLeads(
       continue;
     }
 
-    toInsert.push(payload);
-    markLeadSeen(payload, seenPhoneKeys, seenEmails);
+    toInsert.push(item);
+    markLeadSeen(item.payload, seenPhoneKeys, seenEmails);
   }
 
   if (toInsert.length > 0) {
-    await assignUniqueTpAccountsBulk(toInsert);
+    const payloads = toInsert.map((item) => item.payload);
+    await assignUniqueTpAccountsBulk(payloads);
     await insertClientsBulk(toInsert);
     const agentId = await resolveSystemAgentId();
     await insertActivityLogsForClients(
-      toInsert.map((row) => row.phone),
+      payloads.map((row) => row.phone),
       agentId,
     );
   }
@@ -491,7 +615,10 @@ async function processBulkLeads(
   };
 }
 
-async function processSingleLead(lead: TrackboxLeadBody): Promise<Response> {
+async function processSingleLead(
+  parsedLead: ParsedTrackboxLead,
+): Promise<Response> {
+  const { lead, affiliateUuid } = parsedLead;
   const conflict = await findExistingClientConflict(lead.phone, lead.email);
   if (conflict) {
     return jsonResponse(
@@ -511,15 +638,18 @@ async function processSingleLead(lead: TrackboxLeadBody): Promise<Response> {
   const { data: createdClient, error: insertError } = await supabaseAdmin
     .from("clients")
     .insert(
-      withDiamondAssignment({
-        first_name: data.first_name,
-        last_name: data.last_name,
-        phone: data.phone,
-        email: data.email,
-        country: data.country,
-        tp_account: data.tp_account,
-        lead_status: data.lead_status || "New",
-      }),
+      withAffiliateAssignment(
+        {
+          first_name: data.first_name,
+          last_name: data.last_name,
+          phone: data.phone,
+          email: data.email,
+          country: data.country,
+          tp_account: data.tp_account,
+          lead_status: data.lead_status || "New",
+        },
+        affiliateUuid,
+      ),
     )
     .select(CLIENT_SELECT)
     .single();
@@ -821,6 +951,9 @@ export const Route = createFileRoute("/api/v1/leads")({
 
           if (Array.isArray(body)) {
             const bulkLeads = parseTrackboxLeadArray(body);
+            if (isResolveAffiliateError(bulkLeads)) {
+              return jsonResponse({ error: bulkLeads.error }, 400);
+            }
             if (!bulkLeads) {
               return jsonResponse(
                 {
@@ -835,7 +968,10 @@ export const Route = createFileRoute("/api/v1/leads")({
             return jsonResponse(summary, 200);
           }
 
-          const parsed = parseTrackboxLeadBody(body);
+          const parsed = parseTrackboxLead(body);
+          if (isResolveAffiliateError(parsed)) {
+            return jsonResponse({ error: parsed.error }, 400);
+          }
           if (!parsed) {
             return jsonResponse(
               {

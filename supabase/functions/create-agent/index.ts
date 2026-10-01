@@ -38,9 +38,9 @@ serve(async (req) => {
     const PROVISIONABLE_ROLES = ["Agent", "Manager", "Assistant"] as const;
     const assignedRole =
       typeof requestedRole === "string" &&
-      PROVISIONABLE_ROLES.includes(
-        requestedRole as (typeof PROVISIONABLE_ROLES)[number],
-      )
+        PROVISIONABLE_ROLES.includes(
+          requestedRole as (typeof PROVISIONABLE_ROLES)[number],
+        )
         ? requestedRole
         : "Agent";
 
@@ -68,8 +68,18 @@ serve(async (req) => {
       .eq("id", caller.id)
       .maybeSingle();
 
-    if (callerProfile?.role !== "Admin") {
-      throw new Error("Solo administradores pueden crear miembros del equipo");
+    const ROLE_CREATION_MATRIX: Record<string, string[]> = {
+      Admin: ["Manager", "Assistant", "Agent"],
+      Manager: ["Assistant", "Agent"],
+      Assistant: ["Agent"],
+    };
+
+    const allowedRolesToCreate = ROLE_CREATION_MATRIX[callerProfile?.role ?? ""] ?? [];
+
+    if (!allowedRolesToCreate.includes(assignedRole)) {
+      throw new Error(
+        `Tu rol (${callerProfile?.role ?? "sin rol"}) no tiene permiso para crear usuarios con rol ${assignedRole}`
+      );
     }
 
     const { data: newUser, error: authError } =
